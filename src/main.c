@@ -216,9 +216,14 @@ static void save_visibility(uint8_t *addr, bool visible) {
         char key[20];
         snprintf(key, sizeof(key), "%02X%02X%02X%02X%02X%02X",
             addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
-        uint8_t val = visible ? 1 : 0;
-        ESP_LOGI(TAG, "NVS save visibility: %s -> %d", key, val);
-        nvs_set_u8(nvs, key, val);
+        if (visible) {
+            uint8_t val = 1;
+            ESP_LOGI(TAG, "NVS save visibility: %s -> %d", key, val);
+            nvs_set_u8(nvs, key, val);
+        } else {
+            ESP_LOGI(TAG, "NVS erase visibility: %s", key);
+            nvs_erase_key(nvs, key);
+        }
         nvs_commit(nvs);
         nvs_close(nvs);
     }
@@ -239,6 +244,53 @@ static bool load_visibility(uint8_t *addr) {
         nvs_close(nvs);
     }
     return val ? true : false;
+}
+
+static int remove_device_by_index(int idx, bool erase_nvs) {
+    if (idx < 0 || idx >= device_count) return 0;
+
+    uint8_t *addr = devices[idx].addr;
+    char mac_str[13];
+    snprintf(mac_str, sizeof(mac_str), "%02X%02X%02X%02X%02X%02X",
+             addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+
+    int nvs_removed_count = 0;
+    if (erase_nvs) {
+        nvs_handle_t nvs;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+            if (nvs_erase_key(nvs, mac_str) == ESP_OK) {
+                nvs_removed_count++;
+            }
+
+            const char* suffixes[] = {"_n", "_m", "_i", "_f", "_u"};
+            for (int i = 0; i < 5; i++) {
+                char key[24];
+                snprintf(key, sizeof(key), "%s%s", mac_str, suffixes[i]);
+                if (nvs_erase_key(nvs, key) == ESP_OK) {
+                    nvs_removed_count++;
+                }
+            }
+
+            nvs_commit(nvs);
+            nvs_close(nvs);
+        }
+    }
+
+    for (int i = idx; i < device_count - 1; i++) {
+        memcpy(&devices[i], &devices[i + 1], sizeof(ble_device_t));
+    }
+    device_count--;
+
+    ESP_LOGI(TAG, "🗑️ Removed device from list: %s (nvs_removed=%d)", mac_str, nvs_removed_count);
+    return nvs_removed_count;
+}
+
+static void prune_hidden_devices(void) {
+    for (int i = device_count - 1; i >= 0; i--) {
+        if (!devices[i].visible) {
+            remove_device_by_index(i, false);
+        }
+    }
 }
 
 // Load all devices stored in NVS at startup
@@ -277,10 +329,16 @@ static void load_all_devices_from_nvs(void) {
                     char byte_str[3] = {info.key[i*2], info.key[i*2+1], 0};
                     addr[5-i] = (uint8_t)strtol(byte_str, NULL, 16);
                 }
+
+                bool visible = load_visibility(addr);
+                if (!visible) {
+                    res = nvs_entry_next(&it);
+                    continue;
+                }
                 
                 // Add device to list
                 memcpy(devices[device_count].addr, addr, 6);
-                devices[device_count].visible = load_visibility(addr);
+                devices[device_count].visible = visible;
                 devices[device_count].rssi = 0;
                 devices[device_count].last_seen = 0;
                 devices[device_count].last_sensor_seen = 0;
@@ -1767,6 +1825,7 @@ static esp_err_t api_stop_scan_handler(httpd_req_t *req) {
     
     ESP_LOGI(TAG, "🔍 DISCOVERY MODE stopped");
     allow_new_devices = false;
+    prune_hidden_devices();
     
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
@@ -2360,9 +2419,14 @@ static esp_err_t api_toggle_visibility_handler(httpd_req_t *req) {
         
         if (strcmp(dev_addr, addr_str) == 0) {
             ESP_LOGI(TAG, "Device found at index %d, previous visible=%d", i, devices[i].visible);
-            devices[i].visible = visible ? true : false;
-            save_visibility(devices[i].addr, devices[i].visible);
-            ESP_LOGI(TAG, "✓ Device %d visibility updated -> %d", i, devices[i].visible);
+            if (visible) {
+                devices[i].visible = true;
+                save_visibility(devices[i].addr, true);
+                ESP_LOGI(TAG, "✓ Device %d visibility updated -> 1", i);
+            } else {
+                remove_device_by_index(i, true);
+                ESP_LOGI(TAG, "✓ Device removed from list (visibility off)");
+            }
             break;
         }
     }
@@ -2378,59 +2442,12 @@ static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
     int cleared_nvs = 0;
     int cleared_devices = 0;
 
-    // Hide all devices; do not remove the list
-    for (int i = 0; i < device_count; i++) {
-        if (devices[i].visible) {
-            devices[i].visible = false;
-            cleared_devices++;
-        } else {
-            devices[i].visible = false;
-        }
+    for (int i = device_count - 1; i >= 0; i--) {
+        cleared_nvs += remove_device_by_index(i, true);
+        cleared_devices++;
     }
 
-    // Remove ALL device-related keys from NVS (visibility + settings)
-    nvs_handle_t nvs;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
-        nvs_iterator_t it = NULL;
-        esp_err_t res = nvs_entry_find("nvs", NVS_NAMESPACE, NVS_TYPE_ANY, &it);
-        while (res == ESP_OK) {
-            nvs_entry_info_t info;
-            nvs_entry_info(it, &info);
-
-            // Check if key starts with 12 hex chars (device MAC)
-            bool is_device_key = false;
-            if (strlen(info.key) >= 12) {
-                bool is_hex = true;
-                for (int i = 0; i < 12; i++) {
-                    if (!((info.key[i] >= '0' && info.key[i] <= '9') ||
-                          (info.key[i] >= 'A' && info.key[i] <= 'F') ||
-                          (info.key[i] >= 'a' && info.key[i] <= 'f'))) {
-                        is_hex = false;
-                        break;
-                    }
-                }
-                // Accept keys like: AABBCCDDEEFF, AABBCCDDEEFF_n, AABBCCDDEEFF_m, etc.
-                if (is_hex) {
-                    if (strlen(info.key) == 12 || info.key[12] == '_') {
-                        is_device_key = true;
-                    }
-                }
-            }
-
-            if (is_device_key) {
-                if (nvs_erase_key(nvs, info.key) == ESP_OK) {
-                    cleared_nvs++;
-                }
-            }
-
-            res = nvs_entry_next(&it);
-        }
-        nvs_release_iterator(it);
-        nvs_commit(nvs);
-        nvs_close(nvs);
-    }
-
-    ESP_LOGI(TAG, "🗑️ Visibility reset: %d devices hidden, %d NVS keys removed", cleared_devices, cleared_nvs);
+    ESP_LOGI(TAG, "🗑️ Visibility reset: %d devices removed, %d NVS keys removed", cleared_devices, cleared_nvs);
 
     char response[128];
     snprintf(response, sizeof(response), "{\"ok\":true,\"cleared\":%d,\"nvs_cleared\":%d}", cleared_devices, cleared_nvs);
